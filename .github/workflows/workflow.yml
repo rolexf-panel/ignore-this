@@ -588,7 +588,7 @@ jobs:
 
           # Generate Android BoardConfig template
           # (Single-quoted heredoc aman di sini karena kontennya adalah Make syntax,
-          #  bukan shell command. GHA pre-process ${{ }} sebelum shell melihatnya.)
+          #  GHA tetap mem-parse ekspresi github.event.inputs sebelum shell dijalankan.)
           cat > build_configs/BoardConfigTemplate.mk << 'BOARDEOF'
           # BoardConfig.mk Template
           # Generated from Device Tree Analysis
