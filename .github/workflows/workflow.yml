@@ -49,14 +49,15 @@ on:
 jobs:
   extract-and-analyze:
     runs-on: ubuntu-latest
-    
+    timeout-minutes: 120  # FIX: Tambah batas waktu global agar job tidak hang selamanya
+
     steps:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
       - name: Setup Environment
         run: |
-          sudo apt-get update
+          sudo apt-get update -qq
           sudo apt-get install -y \
             p7zip-full \
             p7zip-rar \
@@ -64,8 +65,8 @@ jobs:
             unzip \
             binwalk \
             device-tree-compiler \
-            android-tools-bootimg \
             abootimg \
+            simg2img \
             liblz4-tool \
             lzop \
             xz-utils \
@@ -75,7 +76,7 @@ jobs:
             curl \
             wget \
             file \
-            hexedit \
+            xxd \
             bc \
             bison \
             build-essential \
@@ -85,67 +86,98 @@ jobs:
             libelf-dev \
             cpio \
             kmod
+          # FIX: Hapus 'android-tools-bootimg' (package tidak ada di Ubuntu, abootimg sudah cukup)
+          # FIX: Hapus 'hexedit' (TUI tool, tidak bisa dipakai di script); pakai 'xxd' sebagai gantinya
+          # FIX: Tambah 'simg2img' yang dipakai di Extract step tapi tidak pernah diinstall
 
       - name: Install Specialized Tools
         run: |
+          # FIX: Tambah --break-system-packages agar pip3 tidak error di Ubuntu 22.04+/24.04
+          # FIX: Tambah --quiet agar log lebih bersih
+
           # Install payload dumper untuk OTA
-          pip3 install protobuf bsdiff4 six
-          git clone https://github.com/vm03/payload_dumper.git /opt/payload_dumper
-          
-          # Install OFP extractor
-          pip3 install ofp-extractor
-          
-          # Install KDZ/TOT tools
-          git clone https://github.com/ehem/kdztools.git /opt/kdztools
-          cd /opt/kdztools && make && sudo make install
-          
+          pip3 install --break-system-packages --quiet protobuf bsdiff4 six
+          git clone --depth=1 https://github.com/vm03/payload_dumper.git /opt/payload_dumper
+
+          # FIX: Hapus 'pip3 install ofp-extractor' — package ini tidak ada di PyPI
+          # Install oppo_decrypt sebagai pengganti untuk OFP/OZIP
+          pip3 install --break-system-packages --quiet pycryptodome
+          git clone --depth=1 https://github.com/bkerler/oppo_decrypt.git /opt/oppo_decrypt || true
+
+          # FIX: kdztools adalah Python project, tidak ada Makefile — hapus 'make && sudo make install'
+          git clone --depth=1 https://github.com/ehem/kdztools.git /opt/kdztools
+          pip3 install --break-system-packages --quiet -r /opt/kdztools/requirements.txt 2>/dev/null || true
+
           # Install AI/ML tools
-          pip3 install ollama requests openai
+          # FIX: Hapus 'openai' (tidak dipakai di workflow ini); tetap pakai requests untuk curl fallback
+          pip3 install --break-system-packages --quiet requests
 
       - name: Download Firmware
         id: download
         run: |
           mkdir -p firmware_output
           cd firmware_output
-          
-          echo "📥 Downloading firmware from ${{ github.event.inputs.firmware_url }}"
-          wget --progress=bar:force -O firmware.bin "${{ github.event.inputs.firmware_url }}" 2>&1 || \
-          wget --no-check-certificate -O firmware.bin "${{ github.event.inputs.firmware_url }}"
-          
+
+          FIRMWARE_URL="${{ github.event.inputs.firmware_url }}"
+          echo "📥 Downloading firmware from ${FIRMWARE_URL}"
+
+          # FIX: Simpan ekstensi asli dari URL sebelum file di-rename jadi firmware.bin
+          # Diperlukan untuk auto-detect tipe firmware (lihat step Extract)
+          URL_BASENAME=$(basename "${FIRMWARE_URL%%\?*}")
+          URL_EXT="${URL_BASENAME##*.}"
+          echo "url_extension=${URL_EXT,,}" >> $GITHUB_OUTPUT
+
+          wget --progress=bar:force --timeout=300 -O firmware.bin "${FIRMWARE_URL}" 2>&1 || \
+          wget --no-check-certificate --timeout=300 -O firmware.bin "${FIRMWARE_URL}"
+
           FILE_SIZE=$(stat -c%s firmware.bin)
           FILE_TYPE=$(file firmware.bin)
-          
-          echo "file_size=$FILE_SIZE" >> $GITHUB_OUTPUT
-          echo "file_type=$FILE_TYPE" >> $GITHUB_OUTPUT
-          
-          echo "✅ Download complete: $FILE_SIZE bytes"
-          echo "📋 File type: $FILE_TYPE"
+
+          echo "file_size=${FILE_SIZE}" >> $GITHUB_OUTPUT
+          echo "file_type=${FILE_TYPE}" >> $GITHUB_OUTPUT
+
+          echo "✅ Download complete: ${FILE_SIZE} bytes"
+          echo "📋 File type: ${FILE_TYPE}"
+          echo "🔗 URL Extension: ${URL_EXT}"
 
       - name: Extract Firmware
         id: extract
         run: |
           cd firmware_output
           mkdir -p extracted dtb_files dts_files analysis_results
-          
+
           FIRMWARE_TYPE="${{ github.event.inputs.firmware_type }}"
-          
-          # Auto-detect jika di-set auto
+
+          # FIX: Auto-detect yang lama pakai '[[ firmware.bin == *.ozip ]]'
+          # File selalu disimpan sebagai 'firmware.bin' sehingga cek ekstensi TIDAK PERNAH true.
+          # Sekarang gunakan kombinasi 'file' command + ekstensi URL asli dari step download.
           if [ "$FIRMWARE_TYPE" == "auto" ]; then
-            if file firmware.bin | grep -q "Android bootimg"; then
+            FILE_INFO=$(file firmware.bin)
+            URL_EXT="${{ steps.download.outputs.url_extension }}"
+            echo "🔎 file command output: ${FILE_INFO}"
+            echo "🔎 URL extension: ${URL_EXT}"
+
+            if echo "$FILE_INFO" | grep -qi "Android bootimg"; then
               FIRMWARE_TYPE="boot_img"
-            elif file firmware.bin | grep -q "sparse"; then
-              FIRMWARE_TYPE="full_rom"
-            elif [[ firmware.bin == *.ozip ]]; then
+            elif [[ "$URL_EXT" == "ozip" ]]; then
               FIRMWARE_TYPE="ozip"
-            elif [[ firmware.bin == *.ofp ]]; then
+            elif [[ "$URL_EXT" == "ofp" ]]; then
               FIRMWARE_TYPE="ofp"
-            elif [[ firmware.bin == *.kdz ]]; then
+            elif [[ "$URL_EXT" == "kdz" ]]; then
               FIRMWARE_TYPE="kdz"
+            elif [[ "$URL_EXT" == "tot" ]]; then
+              FIRMWARE_TYPE="tot"
+            elif echo "$FILE_INFO" | grep -qi "Android sparse image"; then
+              FIRMWARE_TYPE="full_rom"
+            elif echo "$FILE_INFO" | grep -qi "Zip archive\|PKWARE"; then
+              FIRMWARE_TYPE="full_rom"
+            else
+              FIRMWARE_TYPE="full_rom"
             fi
           fi
-          
-          echo "🔧 Detected type: $FIRMWARE_TYPE"
-          
+
+          echo "🔧 Detected/Selected type: $FIRMWARE_TYPE"
+
           case $FIRMWARE_TYPE in
             boot_img|recovery_img)
               echo "Extracting boot image..."
@@ -154,152 +186,213 @@ jobs:
                 mkdir -p ramdisk && cd ramdisk
                 gzip -dc ../initrd.img | cpio -i 2>/dev/null || \
                 lz4 -dc ../initrd.img | cpio -i 2>/dev/null || \
-                xz -dc ../initrd.img | cpio -i 2>/dev/null
+                xz -dc ../initrd.img | cpio -i 2>/dev/null || true
                 cd ..
               fi
-              # Extract DTB from end of zImage if exists
+              # Extract DTB dari akhir zImage jika ada
               if [ -f zImage ]; then
                 python3 << 'PYEOF'
-          import struct
-          with open('zImage', 'rb') as f:
-              data = f.read()
-              # Look for DTB magic (0xd00dfeed) in ARM64 little-endian
-              magic = b'\xed\xfe\x0d\xd0'
-              pos = data.find(magic)
-              if pos != -1:
-                  # Read size from DTB header
-                  size = struct.unpack('>I', data[pos+4:pos+8])[0]
-                  with open('extracted/dtb_from_zImage', 'wb') as dtb:
-                      dtb.write(data[pos:pos+size])
-                  print(f"Extracted DTB from zImage at offset {hex(pos)}, size {size}")
+          import struct, sys
+          try:
+              with open('zImage', 'rb') as f:
+                  data = f.read()
+              # Cari DTB magic (0xd00dfeed) little-endian dan big-endian
+              for magic, endian in [(b'\xd0\x0d\xfe\xed', '>'), (b'\xed\xfe\x0d\xd0', '<')]:
+                  pos = 0
+                  while True:
+                      pos = data.find(magic, pos)
+                      if pos == -1:
+                          break
+                      size = struct.unpack(endian + 'I', data[pos+4:pos+8])[0]
+                      if 64 < size < len(data) - pos:
+                          out_path = f'extracted/dtb_from_zImage_{hex(pos)}.dtb'
+                          with open(out_path, 'wb') as dtb:
+                              dtb.write(data[pos:pos+size])
+                          print(f"Extracted DTB at offset {hex(pos)}, size {size} -> {out_path}")
+                      pos += 1
+          except Exception as e:
+              print(f"Warning: {e}", file=sys.stderr)
           PYEOF
               fi
               ;;
-              
+
             full_rom)
               echo "Extracting full ROM..."
-              binwalk -e firmware.bin -C extracted/ --run-as=root 2>/dev/null || \
+              # FIX: Hapus '--run-as=root' flag yang tidak ada di binwalk versi Ubuntu apt
+              # FIX: Perbaiki urutan argumen binwalk
+              binwalk -eM -C extracted/ firmware.bin 2>/dev/null || \
               7z x firmware.bin -oextracted/ -y
-              
-              # Handle sparse images
+
+              # Handle sparse images (simg2img sudah diinstall di Setup Environment)
               find extracted/ -name "*.img" -type f | while read img; do
-                if file "$img" | grep -q "sparse"; then
-                  simg2img "$img" "${img}.raw"
-                  mv "${img}.raw" "$img"
+                if file "$img" | grep -qi "Android sparse image"; then
+                  echo "Converting sparse image: $img"
+                  simg2img "$img" "${img}.raw" && mv "${img}.raw" "$img" || true
                 fi
               done
               ;;
-              
+
             ozip)
               echo "Extracting OZIP..."
-              python3 /opt/payload_dumper/ozip_decrypt.py firmware.bin extracted/
+              # FIX: payload_dumper tidak punya 'ozip_decrypt.py' — pakai oppo_decrypt sebagai gantinya
+              if [ -f /opt/oppo_decrypt/ozip_decrypt.py ]; then
+                python3 /opt/oppo_decrypt/ozip_decrypt.py firmware.bin extracted/ 2>/dev/null || \
+                7z x firmware.bin -oextracted/ -y
+              else
+                7z x firmware.bin -oextracted/ -y
+              fi
               ;;
-              
+
             ofp)
               echo "Extracting OFP..."
-              ofp-extract firmware.bin -o extracted/
+              # FIX: 'ofp-extract' command tidak ada (package PyPI-nya tidak exist)
+              # Pakai oppo_decrypt atau fallback ke 7z
+              if [ -d /opt/oppo_decrypt ]; then
+                python3 /opt/oppo_decrypt/ofp_mtk_extract.py firmware.bin extracted/ 2>/dev/null || \
+                python3 /opt/oppo_decrypt/ofp_qc_extract.py firmware.bin extracted/ 2>/dev/null || \
+                7z x firmware.bin -oextracted/ -y
+              else
+                7z x firmware.bin -oextracted/ -y
+              fi
               ;;
-              
+
             kdz|tot)
               echo "Extracting KDZ/TOT..."
-              undz.py firmware.bin -o extracted/ 2>/dev/null || \
-              untot.py firmware.bin -o extracted/ 2>/dev/null
+              # FIX: Panggil script via 'python3 /opt/kdztools/' bukan langsung 'undz.py'
+              # (script tidak ada di PATH)
+              python3 /opt/kdztools/undz.py firmware.bin -d extracted/ 2>/dev/null || \
+              python3 /opt/kdztools/untot.py firmware.bin -d extracted/ 2>/dev/null || \
+              7z x firmware.bin -oextracted/ -y
               ;;
           esac
-          
+
           # Cari dan ekstrak DTB dari semua hasil
           echo "🔍 Searching for DTB files..."
-          find extracted/ -type f \( -name "*.dtb" -o -name "*.dtbo" \) -exec cp {} dtb_files/ \;
-          
-          # Cari DTB di dalam binary lain
-          find extracted/ -type f -exec sh -c '
-            if hexdump -C "$1" 2>/dev/null | head -1 | grep -q "d0 0d fe ed\|ed fe 0d d0"; then
-              echo "Found DTB signature in: $1"
-              cp "$1" dtb_files/$(basename "$1").dtb_candidate
-            fi
-          ' _ {} \;
-          
+          find extracted/ -type f \( -name "*.dtb" -o -name "*.dtbo" \) -exec cp {} dtb_files/ \; 2>/dev/null || true
+
+          # Cari DTB di dalam binary lain berdasarkan magic bytes
+          # FIX: Ganti hexdump grep (tidak reliable) dengan python3 untuk pengecekan magic bytes
+          find extracted/ -type f -size +64c -size -50M | while read bin_file; do
+            python3 - "$bin_file" dtb_files/ << 'PYEOF'
+          import sys, struct, os
+          src, dst_dir = sys.argv[1], sys.argv[2]
+          try:
+              with open(src, 'rb') as f:
+                  data = f.read(16)
+              if data[:4] in (b'\xd0\x0d\xfe\xed', b'\xed\xfe\x0d\xd0'):
+                  name = os.path.basename(src) + '.dtb_candidate'
+                  import shutil
+                  shutil.copy2(src, os.path.join(dst_dir, name))
+                  print(f"Found DTB signature in: {src}")
+          except Exception:
+              pass
+          PYEOF
+          done
+
+          # Buat device_info.txt (selalu dibuat agar tidak error saat archiving)
+          {
+            echo "=== Device Info ==="
+            echo "Extraction Date: $(date)"
+            echo "Firmware Type: $FIRMWARE_TYPE"
+            echo "DTB files found:"
+            ls dtb_files/ 2>/dev/null || echo "  (none)"
+            echo ""
+            echo "=== Model strings from extracted files ==="
+            strings extracted/* 2>/dev/null | grep -oP 'model=\S+' | sort -u | head -20 || true
+          } > device_info.txt
+
           DTB_COUNT=$(ls dtb_files/ 2>/dev/null | wc -l)
-          echo "dtb_count=$DTB_COUNT" >> $GITHUB_OUTPUT
-          echo "✅ Found $DTB_COUNT DTB candidate(s)"
+          echo "dtb_count=${DTB_COUNT}" >> $GITHUB_OUTPUT
+          echo "✅ Found ${DTB_COUNT} DTB candidate(s)"
 
       - name: Convert DTB to DTS
         id: convert
         run: |
           cd firmware_output
-          
+
           if [ ! "$(ls -A dtb_files/ 2>/dev/null)" ]; then
-            echo "⚠️ No DTB files found, attempting deep extraction..."
-            # Last resort: strings and grep for DTB patterns
-            strings extracted/* 2>/dev/null | grep -o "model=.*" | head -20 > device_info.txt || true
+            echo "⚠️ No DTB files found."
           fi
-          
-          # Convert each DTB to DTS
+
+          # Konversi setiap DTB ke DTS
           for dtb in dtb_files/*; do
             if [ -f "$dtb" ]; then
               BASENAME=$(basename "$dtb")
-              DTS_NAME="dts_files/${BASENAME%.dtb}.dts"
-              
+              DTS_NAME="dts_files/${BASENAME%.dtb*}.dts"
+
               echo "Converting: $BASENAME"
               dtc -I dtb -O dts -o "$DTS_NAME" "$dtb" 2>/dev/null && \
-              echo "✅ Success: $DTS_NAME" || \
-              echo "❌ Failed to convert: $BASENAME"
-              
-              # Also try with force mode for corrupted DTB
-              if [ ! -f "$DTS_NAME" ] || [ ! -s "$DTS_NAME" ]; then
-                dtc -I dtb -O dts -f -o "$DTS_NAME" "$dtb" 2>/dev/null || true
+                echo "✅ Success: $DTS_NAME" || \
+                echo "❌ Failed normal convert: $BASENAME"
+
+              # Coba force mode untuk DTB yang corrupt
+              if [ ! -s "$DTS_NAME" ]; then
+                dtc -I dtb -O dts -f -o "$DTS_NAME" "$dtb" 2>/dev/null && \
+                  echo "✅ Success (force): $DTS_NAME" || true
               fi
             fi
           done
-          
+
           DTS_COUNT=$(ls dts_files/*.dts 2>/dev/null | wc -l)
-          echo "dts_count=$DTS_COUNT" >> $GITHUB_OUTPUT
-          echo "✅ Converted $DTS_COUNT DTS file(s)"
+          echo "dts_count=${DTS_COUNT}" >> $GITHUB_OUTPUT
+          echo "✅ Converted ${DTS_COUNT} DTS file(s)"
 
       - name: Setup Local AI (Ollama)
+        continue-on-error: true  # FIX: Jangan gagalkan seluruh job hanya karena AI tidak tersedia
         run: |
           # Install Ollama
           curl -fsSL https://ollama.com/install.sh | sh
-          
-          # Start Ollama service
+
+          # Jalankan Ollama service di background
           ollama serve &
-          sleep 5
-          
-          # Pull selected model
+          OLLAMA_PID=$!
+          echo "Waiting for Ollama to start..."
+          sleep 10
+
+          # Verifikasi Ollama berjalan
+          if ! curl -sf http://localhost:11434/api/tags > /dev/null; then
+            echo "⚠️ Ollama failed to start"
+            exit 1
+          fi
+
           MODEL="${{ github.event.inputs.ai_model }}"
-          echo "🤖 Pulling AI model: $MODEL"
-          ollama pull $MODEL
-          
-          # Verify
+          echo "🤖 Pulling AI model: $MODEL (this may take a while for large models)"
+          # FIX: Tambah timeout 30 menit untuk pull model yang bisa berukuran beberapa GB
+          timeout 1800 ollama pull "$MODEL" || {
+            echo "⚠️ Gagal pull model $MODEL, coba fallback ke model yang lebih kecil..."
+            timeout 600 ollama pull tinyllama || true
+          }
+
           ollama list
 
       - name: AI Analysis & Device Tree Generation
         id: ai_analysis
+        continue-on-error: true  # FIX: AI gagal tidak boleh membatalkan artifact upload
         run: |
           cd firmware_output
-          
-          # Create comprehensive prompt file
+
+          # Buat file prompt komprehensif
           cat > ai_prompt.txt << 'PROMPTEOF'
           ROLE: You are an expert Embedded Linux Engineer and Android ROM Developer specializing in Device Tree Source (DTS) analysis and custom ROM development.
-          
+
           TASK: Analyze the provided Device Tree Source file(s) and generate a comprehensive technical report with actionable recommendations.
-          
+
           CONTEXT: This device tree was extracted from firmware for device codename "${{ github.event.inputs.device_codename || 'unknown' }}".
-          
+
           INPUT: The following Device Tree Source (DTS) content:
           ===DTS_CONTENT_START===
           {{DTS_CONTENT}}
           ===DTS_CONTENT_END===
-          
+
           TODO CHECKLIST - Analyze and report on:
-          
+
           ## 1. DEVICE IDENTIFICATION
           - [ ] Extract device model, brand, and codename
           - [ ] Identify SoC (System on Chip) manufacturer and model
           - [ ] Determine architecture (ARM32, ARM64, x86, etc.)
           - [ ] List kernel version compatibility
           - [ ] Identify bootloader requirements
-          
+
           ## 2. HARDWARE COMPONENTS MAPPING
           - [ ] CPU: Cluster configuration, frequencies, regulators
           - [ ] Memory: RAM size, type, frequency, channels
@@ -313,30 +406,30 @@ jobs:
           - [ ] Battery: Fuel gauge, charging IC, capacity
           - [ ] USB: Controller version, OTG support, USB-C features
           - [ ] Other: Fingerprint, IR blaster, LED indicators
-          
+
           ## 3. PINMUX & GPIO ANALYSIS
           - [ ] List all pinctrl configurations
           - [ ] Identify critical GPIO assignments
           - [ ] Note I2C/SPI/UART bus allocations
           - [ ] Map interrupt lines (IRQ)
           - [ ] Document power management GPIOs
-          
+
           ## 4. REGULATORS & POWER MANAGEMENT
           - [ ] PMIC (Power Management IC) identification
           - [ ] Voltage regulators list
           - [ ] Power domains and their dependencies
           - [ ] Sleep/wake configuration
           - [ ] Thermal zones and cooling maps
-          
+
           ## 5. KERNEL COMPATIBILITY ASSESSMENT
           - [ ] Compatible strings analysis
           - [ ] Required kernel drivers list
           - [ ] Driver availability in mainline kernel
           - [ ] Out-of-tree driver requirements
           - [ ] Device-specific quirks or workarounds needed
-          
+
           ## 6. CUSTOM ROM COMPATIBILITY CHECKLIST
-          
+
           ### CRITICAL REQUIREMENTS (Must Have):
           - [ ] **Bootloader**: Unlocked or unlockable? Verify OEM unlock support
           - [ ] **Kernel Source**: Available from OEM? Check GPL compliance
@@ -345,7 +438,7 @@ jobs:
           - [ ] **Verified Boot (AVB)**: Can be disabled or custom keys flashed?
           - [ ] **Treble Info**: A-only, A/B, or Virtual A/B? VNDK version?
           - [ ] **SELinux**: Enforcing/Permissive support in custom recovery?
-          
+
           ### HARDWARE SUPPORT STATUS:
           - [ ] **Graphics**: GPU acceleration available in Mesa/DRM?
           - [ ] **Camera**: HAL3 support possible? Camera2 API implementation?
@@ -354,46 +447,46 @@ jobs:
           - [ ] **Sensors**: HAL compatibility with Android Sensor HAL?
           - [ ] **Biometrics**: Fingerprint driver open source or available?
           - [ ] **Fast Charging**: Power delivery profiles documented?
-          
+
           ### DEVELOPMENT DIFFICULTY:
           - [ ] **Easy**: Common SoC (Snapdragon/Exynos/MediaTek with good community support)
           - [ ] **Medium**: Obscure SoC but documented, or common SoC with locked bootloader
           - [ ] **Hard**: Proprietary-heavy, undocumented, or actively anti-modding
-          
+
           ## 7. MISSING COMPONENTS IDENTIFICATION
           - [ ] List any hardware nodes referenced but not defined
           - [ ] Identify placeholder or dummy nodes
           - [ ] Note any "TODO" or "FIXME" comments in source
           - [ ] Flag incomplete power management configurations
-          
+
           ## 8. RECOMMENDATIONS FOR CUSTOM ROM DEVELOPMENT
-          
+
           ### Immediate Actions:
-          1. 
-          2. 
-          3. 
-          
+          1.
+          2.
+          3.
+
           ### Required Patches:
-          1. 
-          2. 
-          3. 
-          
+          1.
+          2.
+          3.
+
           ### Testing Priority:
-          1. 
-          2. 
-          3. 
-          
+          1.
+          2.
+          3.
+
           ## 9. DEVICE TREE QUALITY SCORE
           Rate each aspect 1-10:
           - Completeness: _/10
           - Documentation: _/10
           - Standard Compliance: _/10
           - Mainline Potential: _/10
-          
+
           OVERALL CUSTOM ROM VIABILITY: [YES/NO/MAYBE]
           Confidence Level: [HIGH/MEDIUM/LOW]
           Estimated Development Effort: [WEEKS/MONTHS/YEARS]
-          
+
           ## 10. GENERATED CONFIGURATION FILES
           Please generate (if applicable):
           - [ ] BoardConfig.mk snippet for Android build
@@ -401,79 +494,89 @@ jobs:
           - [ ] Kernel defconfig recommendations
           - [ ] Recovery.fstab suggestion
           PROMPTEOF
-          
-          # Process each DTS file
+
+          # Proses setiap DTS file
           for dts in dts_files/*.dts; do
             if [ -f "$dts" ]; then
               BASENAME=$(basename "$dts")
               echo "🧠 Analyzing: $BASENAME"
-              
-              # Read DTS content (limit to avoid token limits)
+
+              # Baca konten DTS (batasi agar tidak melebihi token limit)
               DTS_CONTENT=$(head -n 500 "$dts")
-              
+
               # Escape untuk JSON
               DTS_ESCAPED=$(echo "$DTS_CONTENT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))')
-              
-              # Create final prompt
-              FINAL_PROMPT=$(cat ai_prompt.txt | sed "s|{{DTS_CONTENT}}|$DTS_CONTENT|")
-              
-              # Save prompt untuk debugging
+
+              # Buat prompt final dengan substitusi placeholder
+              FINAL_PROMPT=$(sed "s|{{DTS_CONTENT}}|${DTS_CONTENT}|" ai_prompt.txt)
+
+              # Simpan prompt untuk debugging
               echo "$FINAL_PROMPT" > "analysis_results/${BASENAME}_prompt.txt"
-              
-              # Query Ollama
+
+              # Query Ollama dengan timeout
               MODEL="${{ github.event.inputs.ai_model }}"
-              RESPONSE=$(curl -s http://localhost:11434/api/generate \
+              RESPONSE=$(timeout 300 curl -sf --max-time 300 http://localhost:11434/api/generate \
                 -H "Content-Type: application/json" \
                 -d "{
-                  \"model\": \"$MODEL\",
-                  \"prompt\": $(echo "$FINAL_PROMPT" | python3 -c 'import json,sys; print(json.dumps(sys.stdin.read()))'),
+                  \"model\": \"${MODEL}\",
+                  \"prompt\": ${DTS_ESCAPED},
                   \"stream\": false,
                   \"options\": {
                     \"temperature\": 0.3,
                     \"num_ctx\": 4096,
                     \"num_predict\": 2048
                   }
-                }")
-              
-              # Extract response
-              echo "$RESPONSE" | python3 -c "
+                }" 2>/dev/null) || RESPONSE=""
+
+              # Parse dan simpan response
+              if [ -n "$RESPONSE" ]; then
+                echo "$RESPONSE" | python3 -c "
           import sys, json
           try:
               data = json.load(sys.stdin)
-              print(data.get('response', 'No response'))
-          except:
-              print('Error parsing response')
+              print(data.get('response', 'No response from model'))
+          except Exception as e:
+              print(f'Error parsing response: {e}')
           " > "analysis_results/${BASENAME}_analysis.md"
-              
-              echo "✅ Analysis saved: analysis_results/${BASENAME}_analysis.md"
-              
-              # Extract key findings
+                echo "✅ Analysis saved: analysis_results/${BASENAME}_analysis.md"
+              else
+                echo "⚠️ No response from Ollama for $BASENAME (timeout or model unavailable)" \
+                  > "analysis_results/${BASENAME}_analysis.md"
+              fi
+
+              # Ekstrak temuan kunci ke summary
               grep -E "(OVERALL CUSTOM ROM VIABILITY|Confidence Level|Estimated Development Effort)" \
                 "analysis_results/${BASENAME}_analysis.md" >> summary_report.txt || true
             fi
           done
-          
-          # Generate master summary
-          cat > analysis_results/00_MASTER_REPORT.md << 'MASTEREOF'
+
+          # FIX: Heredoc MASTEREOF yang lama pakai single-quote '<< MASTEREOF' sehingga
+          # command substitution $(date), $(cat ...), $(ls ... | wc -l) TIDAK PERNAH expand.
+          # Solusi: pre-compute semua variabel dulu, lalu pakai double-quote heredoc.
+          ANALYSIS_DATE=$(date '+%Y-%m-%d %H:%M:%S UTC')
+          SUMMARY_CONTENT=$(cat summary_report.txt 2>/dev/null || echo "No summary available")
+          DTS_FILE_COUNT=$(ls -1 dts_files/*.dts 2>/dev/null | wc -l | tr -d ' ')
+
+          cat > analysis_results/00_MASTER_REPORT.md << MASTEREOF
           # Device Tree Analysis Master Report
-          
+
           **Firmware URL:** ${{ github.event.inputs.firmware_url }}
           **Device Codename:** ${{ github.event.inputs.device_codename || 'Not specified' }}
-          **Analysis Date:** $(date)
+          **Analysis Date:** ${ANALYSIS_DATE}
           **AI Model Used:** ${{ github.event.inputs.ai_model }}
-          
+
           ## Executive Summary
-          $(cat summary_report.txt 2>/dev/null || echo "No summary available")
-          
+          ${SUMMARY_CONTENT}
+
           ## Files Analyzed
-          $(ls -1 dts_files/*.dts 2>/dev/null | wc -l) DTS files processed
-          
+          ${DTS_FILE_COUNT} DTS files processed
+
           ## Next Steps
           1. Review individual analysis files in this directory
           2. Check compatibility assessment for custom ROM development
           3. Verify hardware support status
           4. Consult device-specific community resources
-          
+
           ---
           *Generated by Firmware Device Tree Extractor Workflow*
           MASTEREOF
@@ -482,34 +585,36 @@ jobs:
         run: |
           cd firmware_output
           mkdir -p build_configs
-          
+
           # Generate Android BoardConfig template
+          # (Single-quoted heredoc aman di sini karena kontennya adalah Make syntax,
+          #  bukan shell command. GHA pre-process ${{ }} sebelum shell melihatnya.)
           cat > build_configs/BoardConfigTemplate.mk << 'BOARDEOF'
           # BoardConfig.mk Template
           # Generated from Device Tree Analysis
           # Device: ${{ github.event.inputs.device_codename || 'unknown' }}
-          
+
           DEVICE_PATH := device/$(MANUFACTURER)/$(DEVICE)
-          
+
           # Architecture
           TARGET_ARCH := arm64
           TARGET_ARCH_VARIANT := armv8-a
           TARGET_CPU_ABI := arm64-v8a
-          TARGET_CPU_ABI2 := 
+          TARGET_CPU_ABI2 :=
           TARGET_CPU_VARIANT := generic
           TARGET_CPU_VARIANT_RUNTIME := cortex-a53
-          
+
           TARGET_2ND_ARCH := arm
           TARGET_2ND_ARCH_VARIANT := armv8-a
           TARGET_2ND_CPU_ABI := armeabi-v7a
           TARGET_2ND_CPU_ABI2 := armeabi
           TARGET_2ND_CPU_VARIANT := generic
           TARGET_2ND_CPU_VARIANT_RUNTIME := cortex-a53
-          
+
           # Bootloader
           TARGET_BOOTLOADER_BOARD_NAME := $(shell echo '${{ github.event.inputs.device_codename }}' | tr '[:lower:]' '[:upper:]')
           TARGET_NO_BOOTLOADER := false
-          
+
           # Kernel
           TARGET_PREBUILT_KERNEL := $(DEVICE_PATH)/prebuilt/kernel
           BOARD_KERNEL_CMDLINE := console=ttyMSM0,115200n8 androidboot.hardware=qcom
@@ -520,59 +625,59 @@ jobs:
           BOARD_SECOND_OFFSET := 0x00f00000
           BOARD_KERNEL_TAGS_OFFSET := 0x00000100
           BOARD_FLASH_BLOCK_SIZE := 262144
-          
+
           # DTB
           BOARD_INCLUDE_DTB_IN_BOOTIMG := true
           BOARD_DTB_OFFSET := 0x01f00000
-          
+
           # Partitions
           BOARD_BOOTIMAGE_PARTITION_SIZE := 67108864
           BOARD_RECOVERYIMAGE_PARTITION_SIZE := 67108864
           BOARD_SYSTEMIMAGE_PARTITION_SIZE := 3221225472
           BOARD_VENDORIMAGE_PARTITION_SIZE := 1073741824
-          
+
           # File systems
           BOARD_SYSTEMIMAGE_FILE_SYSTEM_TYPE := ext4
           BOARD_VENDORIMAGE_FILE_SYSTEM_TYPE := ext4
           TARGET_USERIMAGES_USE_EXT4 := true
           TARGET_USERIMAGES_USE_F2FS := true
-          
+
           # Recovery
           TARGET_RECOVERY_FSTAB := $(DEVICE_PATH)/recovery.fstab
           BOARD_HAS_LARGE_FILESYSTEM := true
-          
+
           # Verified Boot
           BOARD_AVB_ENABLE := true
           BOARD_AVB_MAKE_VBMETA_IMAGE_ARGS += --flags 3
-          
+
           # SEPolicy
           BOARD_SEPOLICY_DIRS += $(DEVICE_PATH)/sepolicy
           SELINUX_IGNORE_NEVERALLOWS := true
           BOARDEOF
-          
+
           # Generate device.mk template
           cat > build_configs/device.mk << 'DEVICEEOF'
           # device.mk Template
           # Generated from Device Tree Analysis
-          
+
           $(call inherit-product, $(SRC_TARGET_DIR)/product/core_64_bit.mk)
           $(call inherit-product, $(SRC_TARGET_DIR)/product/full_base_telephony.mk)
-          
+
           # Device identifier
           PRODUCT_NAME := lineage_${{ github.event.inputs.device_codename }}
           PRODUCT_DEVICE := ${{ github.event.inputs.device_codename }}
           PRODUCT_BRAND := $(MANUFACTURER)
           PRODUCT_MODEL := $(DEVICE_MODEL)
           PRODUCT_MANUFACTURER := $(MANUFACTURER)
-          
+
           PRODUCT_GMS_CLIENTID_BASE := android-$(MANUFACTURER)
-          
+
           # Build fingerprint
           BUILD_FINGERPRINT := $(MANUFACTURER)/$(DEVICE)/$(DEVICE):$(ANDROID_VERSION)/$(BUILD_ID)/$(DATE):user/release-keys
-          
+
           PRODUCT_BUILD_PROP_OVERRIDES += \
               PRIVATE_BUILD_DESC="$(DEVICE)-user $(ANDROID_VERSION) $(BUILD_ID) $(DATE) release-keys"
-          
+
           # Inherit proprietary files
           $(call inherit-product-if-exists, vendor/$(MANUFACTURER)/$(DEVICE)/$(DEVICE)-vendor.mk)
           DEVICEEOF
@@ -580,28 +685,35 @@ jobs:
       - name: Create Final Archive
         run: |
           cd firmware_output
-          
-          # Create comprehensive archive
-          zip -r ../device_tree_analysis_$(date +%Y%m%d_%H%M%S).zip \
+
+          ARCHIVE_NAME="device_tree_analysis_$(date +%Y%m%d_%H%M%S)"
+
+          # Pastikan device_info.txt ada (meski kosong)
+          touch device_info.txt
+
+          # Buat arsip komprehensif
+          zip -r "../${ARCHIVE_NAME}.zip" \
             extracted/ \
             dtb_files/ \
             dts_files/ \
             analysis_results/ \
             build_configs/ \
             device_info.txt \
-            -x "*.tmp" "*.log" 2>/dev/null || \
-          tar -czvf ../device_tree_analysis_$(date +%Y%m%d_%H%M%S).tar.gz \
+            --exclude "*.tmp" --exclude "*.log" 2>/dev/null || \
+          tar -czvf "../${ARCHIVE_NAME}.tar.gz" \
             extracted/ \
             dtb_files/ \
             dts_files/ \
             analysis_results/ \
             build_configs/ \
             device_info.txt 2>/dev/null
-          
-          # Also create minimal DTS-only archive
-          zip -r ../dts_files_only.zip dts_files/ analysis_results/00_MASTER_REPORT.md
-          
-          ls -lh ../*.zip ../*.tar.gz 2>/dev/null
+
+          # Buat arsip minimal khusus DTS
+          # FIX: Tambah '|| true' agar tidak gagal jika file DTS tidak ada
+          zip -r ../dts_files_only.zip dts_files/ analysis_results/00_MASTER_REPORT.md 2>/dev/null || \
+          zip -r ../dts_files_only.zip analysis_results/ 2>/dev/null || true
+
+          ls -lh ../*.zip ../*.tar.gz 2>/dev/null || echo "⚠️ No archive files created"
 
       - name: Upload Artifacts
         uses: actions/upload-artifact@v4
@@ -615,12 +727,14 @@ jobs:
           if-no-files-found: warn
 
       - name: Create Release Summary
+        if: always()  # FIX: Tetap tampilkan summary meski ada step yang gagal
         run: |
           echo "## 🔬 Device Tree Analysis Complete" >> $GITHUB_STEP_SUMMARY
           echo "" >> $GITHUB_STEP_SUMMARY
           echo "| Metric | Value |" >> $GITHUB_STEP_SUMMARY
           echo "|--------|-------|" >> $GITHUB_STEP_SUMMARY
           echo "| Firmware Size | ${{ steps.download.outputs.file_size }} bytes |" >> $GITHUB_STEP_SUMMARY
+          echo "| URL Extension | ${{ steps.download.outputs.url_extension }} |" >> $GITHUB_STEP_SUMMARY
           echo "| DTB Files Found | ${{ steps.extract.outputs.dtb_count }} |" >> $GITHUB_STEP_SUMMARY
           echo "| DTS Files Generated | ${{ steps.convert.outputs.dts_count }} |" >> $GITHUB_STEP_SUMMARY
           echo "| AI Model Used | ${{ github.event.inputs.ai_model }} |" >> $GITHUB_STEP_SUMMARY
