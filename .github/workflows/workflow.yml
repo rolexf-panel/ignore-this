@@ -63,6 +63,9 @@ jobs:
       - name: Checkout Repository
         uses: actions/checkout@v4
 
+      - name: GitHub Workflow Cleaner Action
+        uses: rokibhasansagar/slimhub_actions@v25.42.5
+
       - name: Setup Environment
         run: |
           sudo apt-get update -qq
@@ -110,19 +113,108 @@ jobs:
 
       - name: Download Firmware
         id: download
+        env:
+          FIRMWARE_URL: ${{ github.event.inputs.firmware_url }}
         run: |
           mkdir -p firmware_output
           cd firmware_output
 
-          FIRMWARE_URL="${{ github.event.inputs.firmware_url }}"
-          echo "Downloading firmware from ${FIRMWARE_URL}"
+          FIRMWARE_URL="${FIRMWARE_URL}"  # sudah di-set via env block di atas
+          echo "Input URL: ${FIRMWARE_URL}"
 
-          URL_BASENAME=$(basename "${FIRMWARE_URL%%\?*}")
-          URL_EXT="${URL_BASENAME##*.}"
-          echo "url_extension=${URL_EXT,,}" >> $GITHUB_OUTPUT
+          # ── Pixeldrain handler ────────────────────────────────────────────────
+          # Format yang didukung:
+          #   https://pixeldrain.com/u/FILEID
+          #   https://pixeldrain.com/u/FILEID#item=SOMETHING  (multi-file list)
+          #   https://pixeldrain.com/l/LISTID                 (daftar/album)
+          if echo "${FIRMWARE_URL}" | grep -qi "pixeldrain\.com"; then
+            echo "Pixeldrain link detected, resolving direct download URL..."
 
-          wget --progress=bar:force --timeout=300 -O firmware.bin "${FIRMWARE_URL}" 2>&1 || \
-          wget --no-check-certificate --timeout=300 -O firmware.bin "${FIRMWARE_URL}"
+            python3 << 'PYEOF'
+          import re, json, sys, os, urllib.request, urllib.error
+
+          url = os.environ.get('FIRMWARE_URL', '')
+
+          # Ekstrak file_id dari /u/FILEID atau /u/FILEID#item=...
+          match = re.search(r'pixeldrain\.com/u/([A-Za-z0-9]+)', url)
+          if not match:
+              # Coba format list /l/LISTID — ambil item pertama via API
+              list_match = re.search(r'pixeldrain\.com/l/([A-Za-z0-9]+)', url)
+              if list_match:
+                  list_id = list_match.group(1)
+                  api_url = f"https://pixeldrain.com/api/list/{list_id}"
+                  try:
+                      req = urllib.request.Request(api_url, headers={"User-Agent": "curl/7.88"})
+                      with urllib.request.urlopen(req, timeout=15) as r:
+                          data = json.loads(r.read())
+                      files = data.get("files", [])
+                      if not files:
+                          print("ERROR: Pixeldrain list is empty", file=sys.stderr)
+                          sys.exit(1)
+                      file_id = files[0]["id"]
+                      orig_name = files[0].get("name", "firmware.bin")
+                      print(f"List mode: picking first file '{orig_name}' (id={file_id})")
+                  except Exception as e:
+                      print(f"ERROR fetching Pixeldrain list: {e}", file=sys.stderr)
+                      sys.exit(1)
+              else:
+                  print("ERROR: Could not extract Pixeldrain file ID from URL", file=sys.stderr)
+                  sys.exit(1)
+          else:
+              file_id = match.group(1)
+              # Ambil nama file asli dari metadata API
+              api_info_url = f"https://pixeldrain.com/api/file/{file_id}/info"
+              orig_name = "firmware.bin"
+              try:
+                  req = urllib.request.Request(api_info_url, headers={"User-Agent": "curl/7.88"})
+                  with urllib.request.urlopen(req, timeout=15) as r:
+                      info = json.loads(r.read())
+                  orig_name = info.get("name", "firmware.bin")
+                  print(f"Pixeldrain file info: name={orig_name}, size={info.get('size','-')}")
+              except Exception as e:
+                  print(f"Warning: could not fetch Pixeldrain file info: {e}")
+
+          direct_url = f"https://pixeldrain.com/api/file/{file_id}"
+          ext = os.path.splitext(orig_name)[1].lstrip('.').lower() or 'bin'
+
+          # Tulis ke file sementara agar dibaca oleh shell
+          with open('/tmp/pd_direct_url', 'w') as f:
+              f.write(direct_url)
+          with open('/tmp/pd_url_ext', 'w') as f:
+              f.write(ext)
+          with open('/tmp/pd_orig_name', 'w') as f:
+              f.write(orig_name)
+
+          print(f"Direct download URL: {direct_url}")
+          print(f"Original filename  : {orig_name}")
+          print(f"Extension          : {ext}")
+          PYEOF
+
+            FIRMWARE_URL=$(cat /tmp/pd_direct_url)
+            PD_URL_EXT=$(cat /tmp/pd_url_ext)
+            PD_ORIG_NAME=$(cat /tmp/pd_orig_name)
+            echo "Resolved Pixeldrain URL: ${FIRMWARE_URL}"
+            echo "Original filename: ${PD_ORIG_NAME}"
+          fi
+          # ── End Pixeldrain handler ────────────────────────────────────────────
+
+          # Ekstrak ekstensi dari URL (atau dari nama asli Pixeldrain jika tersedia)
+          if [ -n "${PD_URL_EXT}" ]; then
+            URL_EXT="${PD_URL_EXT}"
+          else
+            URL_BASENAME=$(basename "${FIRMWARE_URL%%\?*}")
+            URL_EXT="${URL_BASENAME##*.}"
+            URL_EXT="${URL_EXT,,}"
+          fi
+          echo "url_extension=${URL_EXT}" >> $GITHUB_OUTPUT
+          echo "Detected extension: ${URL_EXT}"
+
+          # Download dengan wget; tambah header untuk Pixeldrain agar tidak kena rate-limit
+          wget --progress=bar:force --timeout=600 \
+               --header="User-Agent: curl/7.88.1" \
+               -O firmware.bin "${FIRMWARE_URL}" 2>&1 || \
+          wget --no-check-certificate --timeout=600 \
+               -O firmware.bin "${FIRMWARE_URL}"
 
           FILE_SIZE=$(stat -c%s firmware.bin)
           FILE_TYPE=$(file firmware.bin)
